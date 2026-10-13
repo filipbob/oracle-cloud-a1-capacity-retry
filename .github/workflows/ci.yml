@@ -24,7 +24,10 @@ jobs:
         run: bash -n oci_capacity_retry.sh bootstrap_oci_network.sh
 
       - name: Compile Python
-        run: python -m py_compile oracle_free_tier_checker.py
+        run: python -m py_compile oracle_free_tier_checker.py bark_push.py
+
+      - name: Test retry jitter and notifications without external services
+        run: python -m unittest discover -s tests -v
 
       - name: Run shell dry-run
         env:

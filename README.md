@@ -11,6 +11,8 @@ It is intended for an Always Free workload, but it does not assume a specific Or
 - Skips a launch when OCI returns OUT_OF_HOST_CAPACITY.
 - Spaces API calls to reduce the chance of TooManyRequests responses.
 - Uses exponential backoff between retry cycles, with a configurable maximum.
+- Supports optional jitter to spread retry cycles across independent clients.
+- Can send optional Bark push notifications for launch, completion, and error events.
 - Launches an instance only when capacity is reported as available.
 - Waits for the instance to reach RUNNING.
 - Rechecks total OCPU and memory usage and stops when the target is reached.
@@ -24,6 +26,7 @@ It is intended for an Always Free workload, but it does not assume a specific Or
 | --- | --- |
 | oci_capacity_retry.sh | Main capacity-aware retry and launch process |
 | oracle_free_tier_checker.py | Read-only capacity checker; it never creates instances |
+| bark_push.py | Optional Bark notification helper; uses the Python standard library |
 | bootstrap_oci_network.sh | Idempotently creates a VCN, Internet Gateway, subnet, and SSH security list |
 | .env.example | Safe configuration template without account secrets |
 | .gitignore | Prevents .env files, keys, OCI config files, and logs from being committed |
@@ -65,6 +68,7 @@ Important variables:
 | SUBNET_ID / IMAGE_ID | Optional fixed IDs; empty values are resolved dynamically |
 | SLEEP_SECONDS | Initial delay between retry cycles |
 | MAX_RETRY_DELAY_SECONDS | Maximum exponential backoff delay |
+| RETRY_JITTER_SECONDS | Optional extra wait of 0 to this many seconds per retry cycle; defaults to `0` (disabled), accepts integers from `0` to `32767` |
 | CAPACITY_REQUEST_DELAY_SECONDS | Delay between capacity-report calls |
 | LOG_TO_FILE / LOG_DIR | Enable daily log files and optionally choose their directory |
 | LOG_PREFIX | Prefix for daily log filenames |
@@ -74,6 +78,10 @@ Important variables:
 | NTP_MAX_OFFSET_SECONDS | Maximum accepted measured clock offset; `120` leaves margin below OCI's five-minute limit |
 | NTP_TIMEOUT_SECONDS | Timeout for each NTP query |
 | NTP_RETRY_DELAY_SECONDS | How long to wait before retrying when NTP is unavailable or unsafe |
+| BARK_KEY | Bark device key; empty by default, which disables push notifications |
+| BARK_SERVER_URL | Bark server base URL; defaults to `https://api.day.app`, supports a self-hosted server and reverse-proxy paths |
+| BARK_TIMEOUT_SECONDS | Total time budget for the notification worker in seconds, including connection and response reading; defaults to `5`, accepts integers from `1` to `60` |
+| BARK_SOUND / BARK_GROUP | Optional notification sound and group; empty values use the server defaults |
 | SSH_SOURCE_CIDR | TCP/22 source for the network helper; restrict it to your /32 when possible |
 
 For the current Always Free A1 target, the total limit is 2 OCPU and 12 GB of memory. These values are configuration values, not hardcoded behavior.
@@ -100,7 +108,19 @@ Capacity retry and launch:
 
 The script uses a lock file to prevent parallel launch processes. Keep runtime logs in a private directory outside the Git repository.
 
+Set `RETRY_JITTER_SECONDS=30` to add a random delay of 0–30 seconds to each retry cycle. The base delay still follows the existing exponential backoff and resets; jitter is sampled again for each wait and is never fed back into the next base delay. `MAX_RETRY_DELAY_SECONDS` caps the base delay, so the actual wait can reach `MAX_RETRY_DELAY_SECONDS + RETRY_JITTER_SECONDS`. Wait messages report the actual delay. Jitter does not affect spacing between capacity-report calls, network rechecks, or NTP recovery waits.
+
 When `LOG_TO_FILE=1`, the script writes one log file per calendar day and checks for a new day at the start of every retry cycle. With `LOG_RETENTION_DAYS=3`, files older than three days are removed automatically. The active log and the most recent history remain available in `LOG_DIR`.
+
+### Bark notifications
+
+Install the [Bark iOS app](https://github.com/Finb/Bark) and copy its device key into `BARK_KEY` in your private `.env`. The helper uses the [Bark V2 JSON API](https://github.com/Finb/bark-server/blob/master/docs/API_V2.md) and requires no additional Python packages. For a self-hosted server, set `BARK_SERVER_URL` to its base URL, without the device key or `/push`; use HTTPS when sending over a network you do not trust.
+
+Bark receives the existing notification titles and messages for successful launches, target completion, and errors. These messages may include the availability domain and compute usage. Notifications are disabled until a device key is configured, and dry runs never send them. `BARK_SOUND` and `BARK_GROUP` optionally customize their presentation.
+
+The device key is read from the environment and sent in the JSON body, never in command-line arguments or the request URL. Redirects are rejected, and failure messages omit server URLs, response bodies, and exception details. A failed notification is reported as a warning and does not change the retry process or its exit status.
+
+The command-line helper supervises notification sending in a separate process. If the worker exceeds `BARK_TIMEOUT_SECONDS`, it is stopped and a sanitized warning is logged, allowing the retry process to continue even when DNS stalls or a server sends the response slowly. Process startup and cleanup can add a small amount of overhead to the configured budget.
 
 ### Clock synchronization
 

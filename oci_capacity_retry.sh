@@ -56,6 +56,7 @@ SUBNET_ID="${SUBNET_ID:-}"
 IMAGE_ID="${IMAGE_ID:-}"
 DRY_RUN="${DRY_RUN:-0}"
 OCI_BIN="${OCI_BIN:-}"
+RETRY_JITTER_SECONDS="${RETRY_JITTER_SECONDS:-0}"
 LOG_TO_FILE="${LOG_TO_FILE:-1}"
 LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 LOG_PREFIX="${LOG_PREFIX:-oci-capacity-retry}"
@@ -79,6 +80,10 @@ fi
 
 if [[ "$LOG_TO_FILE" != "0" && "$LOG_TO_FILE" != "1" ]]; then
   echo "ERROR: LOG_TO_FILE must be 0 or 1."
+  exit 1
+fi
+if ! [[ "$RETRY_JITTER_SECONDS" =~ ^(0|[1-9][0-9]{0,4})$ ]] || (( RETRY_JITTER_SECONDS > 32767 )); then
+  echo "ERROR: RETRY_JITTER_SECONDS must be an integer between 0 and 32767."
   exit 1
 fi
 if ! [[ "$LOG_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]; then
@@ -362,12 +367,15 @@ if [[ ! -f "$SSH_KEY_FILE" ]]; then
   exit 1
 fi
 
-# --- Notification (macOS pop-up + sound) ---
+# --- Notification (macOS pop-up + sound, optional Bark push) ---
 notify() {
   local title="$1"
   local message="$2"
   if command -v osascript >/dev/null 2>&1; then
     osascript -e "display notification \"${message}\" with title \"${title}\" sound name \"Glass\"" 2>/dev/null
+  fi
+  if [[ -n "${BARK_KEY:-}" ]]; then
+    python3 "$SCRIPT_DIR/bark_push.py" "$title" "$message" || true
   fi
   echo "[NOTIFICATION] ${title}: ${message}"
 }
@@ -418,6 +426,13 @@ target_reached() {
   local current_mem="$2"
   (( $(echo "$current_ocpu >= $TOTAL_OCPU_LIMIT" | bc -l 2>/dev/null || echo 0) )) || \
     (( $(echo "$current_mem >= $TOTAL_MEMORY_LIMIT" | bc -l 2>/dev/null || echo 0) ))
+}
+
+# Jitter changes the actual wait, not the base used by exponential backoff.
+# Bash RANDOM returns 0..32767, matching the validated jitter range.
+set_cycle_delay() {
+  local base_delay="$1"
+  CYCLE_DELAY_SECONDS=$(( base_delay + RANDOM % (RETRY_JITTER_SECONDS + 1) ))
 }
 
 attempt=0
@@ -599,14 +614,17 @@ while true; do
 
   if (( launch_uncertain )); then
     RETRY_DELAY_SECONDS="$SLEEP_SECONDS"
-    echo "[$(date '+%H:%M:%S')] Waiting ${RETRY_DELAY_SECONDS}s before checking the uncertain launch request again..."
-    sleep "$RETRY_DELAY_SECONDS"
+    set_cycle_delay "$RETRY_DELAY_SECONDS"
+    echo "[$(date '+%H:%M:%S')] Waiting ${CYCLE_DELAY_SECONDS}s before checking the uncertain launch request again..."
+    sleep "$CYCLE_DELAY_SECONDS"
     continue
   fi
 
   if (( launch_succeeded )); then
     RETRY_DELAY_SECONDS="$SLEEP_SECONDS"
-    sleep "$RETRY_DELAY_SECONDS"
+    set_cycle_delay "$RETRY_DELAY_SECONDS"
+    echo "[$(date '+%H:%M:%S')] Waiting ${CYCLE_DELAY_SECONDS}s before refreshing usage after the successful launch."
+    sleep "$CYCLE_DELAY_SECONDS"
     continue
   fi
 
@@ -615,21 +633,24 @@ while true; do
     if (( RETRY_DELAY_SECONDS > MAX_RETRY_DELAY_SECONDS )); then
       RETRY_DELAY_SECONDS="$MAX_RETRY_DELAY_SECONDS"
     fi
-    echo "[$(date '+%H:%M:%S')] OCI rate limit; waiting ${RETRY_DELAY_SECONDS}s before the next cycle."
-    sleep "$RETRY_DELAY_SECONDS"
+    set_cycle_delay "$RETRY_DELAY_SECONDS"
+    echo "[$(date '+%H:%M:%S')] OCI rate limit; waiting ${CYCLE_DELAY_SECONDS}s before the next cycle."
+    sleep "$CYCLE_DELAY_SECONDS"
     continue
   fi
 
   if (( cycle_had_error )); then
     RETRY_DELAY_SECONDS="$SLEEP_SECONDS"
-    echo "[$(date '+%H:%M:%S')] The cycle had an error; retrying in ${RETRY_DELAY_SECONDS}s."
-    sleep "$RETRY_DELAY_SECONDS"
+    set_cycle_delay "$RETRY_DELAY_SECONDS"
+    echo "[$(date '+%H:%M:%S')] The cycle had an error; retrying in ${CYCLE_DELAY_SECONDS}s."
+    sleep "$CYCLE_DELAY_SECONDS"
     continue
   fi
 
   if (( cycle_had_capacity )); then
-    echo "[$(date '+%H:%M:%S')] All checked zones are out of capacity. Waiting ${RETRY_DELAY_SECONDS}s before the next cycle."
-    sleep "$RETRY_DELAY_SECONDS"
+    set_cycle_delay "$RETRY_DELAY_SECONDS"
+    echo "[$(date '+%H:%M:%S')] All checked zones are out of capacity. Waiting ${CYCLE_DELAY_SECONDS}s before the next cycle."
+    sleep "$CYCLE_DELAY_SECONDS"
     if (( RETRY_DELAY_SECONDS < MAX_RETRY_DELAY_SECONDS )); then
       RETRY_DELAY_SECONDS=$(( RETRY_DELAY_SECONDS * 2 ))
       if (( RETRY_DELAY_SECONDS > MAX_RETRY_DELAY_SECONDS )); then
@@ -640,5 +661,7 @@ while true; do
   fi
 
   RETRY_DELAY_SECONDS="$SLEEP_SECONDS"
-  sleep "$RETRY_DELAY_SECONDS"
+  set_cycle_delay "$RETRY_DELAY_SECONDS"
+  echo "[$(date '+%H:%M:%S')] Waiting ${CYCLE_DELAY_SECONDS}s before the next cycle."
+  sleep "$CYCLE_DELAY_SECONDS"
 done
